@@ -59,6 +59,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers.evidence import Evidence, claim_doc_id, claim_text, trim_candidates
 from harness.middleware import Middleware
 
 
@@ -68,16 +69,32 @@ class CitationChecker(Middleware):
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report
+        ev = Evidence(ctx)
+        moved = 0
+        for claim in claims:
+            text = claim_text(claim)
+            if text is None:
+                continue
+            doc_id = claim_doc_id(claim)
+            if ev.valid_id(doc_id) and doc_id in ev.retrieved_set and ev.on_line(text, doc_id):
+                continue  # trích dẫn đã đúng
+            # Chỉ gắn vào tài liệu ĐÃ truy xuất (fetch trước, rồi search),
+            # và chỉ khi câu nằm gọn trên một dòng của nó. Mô hình thật hay
+            # thêm dấu chấm / nháy ở hai đầu: thử cả bản CẮT BỚT (substring
+            # của chữ mô hình — hợp lệ), không bao giờ sửa chữ bên trong.
+            for candidate in trim_candidates(text):
+                source = ev.source(candidate, prefer=doc_id) if ev.saw(candidate) else None
+                if source is None:
+                    continue
+                if candidate != text:
+                    claim["text"] = candidate
+                if source != doc_id:
+                    claim["doc_id"] = source  # đổi nguồn
+                    moved += 1
+                break
+        ctx.state["citations_moved"] = moved
+        report["citations"] = sorted({d for d in map(claim_doc_id, claims) if d})
+        return report
